@@ -1,0 +1,350 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: agnos-dev
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: dev
+data:
+  APP_ENV: development
+  APP_VERSION: 1.0.0-dev
+  PORT: '8080'
+  PUBLIC_PORT: '8090'
+  HEALTH_PORT: '8081'
+  WORKER_INTERVAL: 30s
+  LOG_LEVEL: debug
+---
+# WARNING: Secrets contain placeholder values for local/CI usage only.
+# In production, use Sealed Secrets, External Secrets Operator, or SOPS.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: agnos-dev
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: dev
+type: Opaque
+stringData:
+  DB_DSN: postgres://agnos_dev:agnos_dev_pass@postgres-rw:5432/agnos_dev?sslmode=disable
+  POSTGRES_USER: agnos_dev
+  POSTGRES_PASSWORD: agnos_dev_pass
+  POSTGRES_DB: agnos_dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: agnos-dev
+  labels:
+    app: api
+    environment: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: api
+        environment: dev
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '8080'
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+      - name: api
+        image: agnos/api:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+          name: internal
+        - containerPort: 8090
+          name: public
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: db-secret
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      terminationGracePeriodSeconds: 15
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: agnos-dev
+  labels:
+    app: worker
+    environment: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+        environment: dev
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '8081'
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+      - name: worker
+        image: agnos/worker:latest
+        imagePullPolicy: Never
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: db-secret
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8081
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      terminationGracePeriodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: agnos-dev
+  labels:
+    app: api
+    environment: dev
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-public
+  namespace: agnos-dev
+  labels:
+    app: api
+    environment: dev
+spec:
+  type: NodePort
+  selector:
+    app: api
+  ports:
+  - name: public
+    port: 80
+    targetPort: 8090
+    nodePort: 30090
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: agnos-dev
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: dev
+type: kubernetes.io/basic-auth
+stringData:
+  username: agnos_dev
+  password: agnos_dev_pass
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  namespace: agnos-dev
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: dev
+spec:
+  instances: 2
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: "64MB"
+  bootstrap:
+    initdb:
+      database: agnos_dev
+      owner: agnos_dev
+      secret:
+        name: db-credentials
+  storage:
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  monitoring:
+    enablePodMonitor: true
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: agnos-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 8080
+  - ports:
+    - protocol: TCP
+      port: 8090
+  egress:
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - podSelector:
+        matchLabels:
+          cnpg.io/cluster: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-network-policy
+  namespace: agnos-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: worker
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 8081
+  egress:
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - podSelector:
+        matchLabels:
+          cnpg.io/cluster: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-network-policy
+  namespace: agnos-dev
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: api
+    - podSelector:
+        matchLabels:
+          app: worker
+    ports:
+    - protocol: TCP
+      port: 5432
+  - from:
+    - podSelector:
+        matchLabels:
+          cnpg.io/cluster: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: agnos-dev
+spec:
+  limits:
+  - default:
+      cpu: 200m
+      memory: 256Mi
+    defaultRequest:
+      cpu: 50m
+      memory: 64Mi
+    type: Container
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: agnos-dev
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 512Mi
+    limits.cpu: "2"
+    limits.memory: 2Gi
+    pods: "20"

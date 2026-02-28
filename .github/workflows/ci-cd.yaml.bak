@@ -1,0 +1,1506 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [dev, uat, prod]
+  pull_request:
+    branches: [uat, prod]
+
+env:
+  API_IMAGE: agnos/api
+  WORKER_IMAGE: agnos/worker
+  GO_VERSION: '1.25'
+  GOLANGCI_LINT_VERSION: 'v2.10.1'
+  DEPLOY_ENV: ${{ github.ref == 'refs/heads/prod' && 'prod' || github.ref == 'refs/heads/uat' && 'uat' || 'dev' }}
+
+jobs:
+  # =========================================
+  # Stage 1: Lint & Test
+  # =========================================
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api, worker]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: ${{ !env.ACT }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.service }}/go.sum
+
+      - name: Set up Go (act)
+        if: ${{ env.ACT }}
+        run: |
+          if command -v go &>/dev/null; then echo "Go already installed"; exit 0; fi
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          GO_FULL_VERSION=$(curl -s 'https://go.dev/dl/?mode=json' | grep -o '"version":"go${{ env.GO_VERSION }}[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$GO_FULL_VERSION" ]; then GO_FULL_VERSION="go1.25.0"; fi
+          for attempt in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 -o /tmp/go.tar.gz "https://go.dev/dl/${GO_FULL_VERSION}.linux-${GOARCH}.tar.gz" && tar -C /usr/local -xzf /tmp/go.tar.gz; then
+              rm -f /tmp/go.tar.gz
+              break
+            fi
+            echo "Go download attempt $attempt failed, retrying..."
+            rm -f /tmp/go.tar.gz
+            sleep 5
+            if [ "$attempt" -eq 3 ]; then echo "Failed to download Go after 3 attempts"; exit 1; fi
+          done
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Download dependencies
+        run: go mod download
+        working-directory: ${{ matrix.service }}
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(go env GOPATH)/bin ${{ env.GOLANGCI_LINT_VERSION }}
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+        working-directory: ${{ matrix.service }}
+
+      - name: Run tests with coverage
+        run: |
+          mkdir -p results/unit-test
+          go test -v -race -coverprofile=results/unit-test/${{ matrix.service }}-coverage.out ./...
+          go tool cover -html=results/unit-test/${{ matrix.service }}-coverage.out -o results/unit-test/${{ matrix.service }}-coverage.html
+          echo ""
+          echo "📊 ${{ matrix.service }} Coverage:"
+          go tool cover -func=results/unit-test/${{ matrix.service }}-coverage.out | tail -1
+        working-directory: ${{ matrix.service }}
+
+      - name: Upload unit test results
+        if: ${{ always() && !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-unit-test-${{ matrix.service }}
+          path: ${{ matrix.service }}/results/unit-test/
+          retention-days: 7
+
+      - name: Copy results to shared dir (act)
+        if: ${{ always() && env.ACT }}
+        run: |
+          mkdir -p /tmp/act-results/unit-test
+          cp -r ${{ matrix.service }}/results/unit-test/* /tmp/act-results/unit-test/ 2>/dev/null || true
+
+  # =========================================
+  # Stage 2: SAST (gosec)
+  # =========================================
+  sast:
+    name: SAST (gosec)
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: ${{ !env.ACT }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Go (act)
+        if: ${{ env.ACT }}
+        run: |
+          if command -v go &>/dev/null; then echo "Go already installed"; exit 0; fi
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          GO_FULL_VERSION=$(curl -s 'https://go.dev/dl/?mode=json' | grep -o '"version":"go${{ env.GO_VERSION }}[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$GO_FULL_VERSION" ]; then GO_FULL_VERSION="go1.25.0"; fi
+          for attempt in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 -o /tmp/go.tar.gz "https://go.dev/dl/${GO_FULL_VERSION}.linux-${GOARCH}.tar.gz" && tar -C /usr/local -xzf /tmp/go.tar.gz; then
+              rm -f /tmp/go.tar.gz
+              break
+            fi
+            echo "Go download attempt $attempt failed, retrying..."
+            rm -f /tmp/go.tar.gz
+            sleep 5
+            if [ "$attempt" -eq 3 ]; then echo "Failed to download Go after 3 attempts"; exit 1; fi
+          done
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Create results directory
+        run: mkdir -p results/sast
+
+      - name: Run gosec SAST scan - API
+        run: |
+          echo "🔒 Running SAST scan on API..."
+          gosec -fmt=json -out=../results/sast/gosec-api-report.json -stdout -verbose=text ./...
+        working-directory: api
+
+      - name: Run gosec SAST scan - Worker
+        run: |
+          echo "🔒 Running SAST scan on Worker..."
+          gosec -fmt=json -out=../results/sast/gosec-worker-report.json -stdout -verbose=text ./...
+        working-directory: worker
+
+      - name: Upload SAST reports
+        if: ${{ always() && !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-sast
+          path: results/sast/
+
+      - name: Copy results to shared dir (act)
+        if: ${{ always() && env.ACT }}
+        run: |
+          mkdir -p /tmp/act-results/sast
+          cp -r results/sast/* /tmp/act-results/sast/ 2>/dev/null || true
+
+  # =========================================
+  # Stage 3: SonarQube Analysis + Quality Gate
+  # (skipped on dev branch for faster iteration)
+  # =========================================
+  sonarqube:
+    name: SonarQube + Quality Gate
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, sast]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/prod')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start SonarQube (GitHub Actions only)
+        if: ${{ !env.ACT }}
+        run: |
+          docker compose -f docker-compose.sonarqube.yaml up -d
+          echo "⏳ Waiting for SonarQube to start..."
+
+      - name: Set up Go
+        if: ${{ !env.ACT }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Go (act)
+        if: ${{ env.ACT }}
+        run: |
+          if command -v go &>/dev/null; then echo "Go already installed"; exit 0; fi
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          GO_FULL_VERSION=$(curl -s 'https://go.dev/dl/?mode=json' | grep -o '"version":"go${{ env.GO_VERSION }}[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$GO_FULL_VERSION" ]; then GO_FULL_VERSION="go1.25.0"; fi
+          for attempt in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 -o /tmp/go.tar.gz "https://go.dev/dl/${GO_FULL_VERSION}.linux-${GOARCH}.tar.gz" && tar -C /usr/local -xzf /tmp/go.tar.gz; then
+              rm -f /tmp/go.tar.gz
+              break
+            fi
+            echo "Go download attempt $attempt failed, retrying..."
+            rm -f /tmp/go.tar.gz
+            sleep 5
+            if [ "$attempt" -eq 3 ]; then echo "Failed to download Go after 3 attempts"; exit 1; fi
+          done
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Generate test coverage
+        run: |
+          cd api && go test -coverprofile=coverage-api.out ./...
+          cd ../worker && go test -coverprofile=coverage-worker.out ./...
+
+      - name: Set Sonar Host URL
+        run: |
+          if [ "$ACT" = "true" ]; then
+            echo "SONAR_HOST=http://host.docker.internal:9000" >> $GITHUB_ENV
+          else
+            echo "SONAR_HOST=http://localhost:9000" >> $GITHUB_ENV
+          fi
+
+      - name: Wait for SonarQube to be ready
+        run: |
+          echo "⏳ Waiting for SonarQube at ${{ env.SONAR_HOST }}..."
+          for i in $(seq 1 60); do
+            STATUS=$(curl -s ${{ env.SONAR_HOST }}/api/system/status | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "")
+            if [ "$STATUS" = "UP" ]; then
+              echo "✅ SonarQube is ready!"
+              break
+            fi
+            echo "   Waiting... ($i/60)"
+            sleep 5
+            if [ "$i" -eq 60 ]; then
+              echo "❌ Timeout waiting for SonarQube to be ready."
+              exit 1
+            fi
+          done
+
+      - name: Create SonarQube project and token
+        id: sonar-setup
+        env:
+          SONAR_ADMIN_PASSWORD: ${{ secrets.SONAR_ADMIN_PASSWORD || 'Admin@12345678' }}
+        run: |
+          # Change default admin password
+          curl -s -u admin:admin -X POST \
+            "${{ env.SONAR_HOST }}/api/users/change_password" \
+            -d "login=admin&previousPassword=admin&password=${SONAR_ADMIN_PASSWORD}" || true
+
+          # Create project
+          curl -s -u admin:${SONAR_ADMIN_PASSWORD} -X POST \
+            "${{ env.SONAR_HOST }}/api/projects/create" \
+            -d "name=Agnos+DevOps&project=agnos-devops" || true
+
+          # Generate token
+          TOKEN=$(curl -s -u admin:${SONAR_ADMIN_PASSWORD} -X POST \
+            "${{ env.SONAR_HOST }}/api/user_tokens/generate" \
+            -d "name=pipeline-$(date +%s)&type=USER_TOKEN" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+          echo "SONAR_TOKEN=${TOKEN}" >> $GITHUB_OUTPUT
+
+          # Create custom quality gate with 60% coverage threshold
+          curl -s -u admin:${SONAR_ADMIN_PASSWORD} -X POST \
+            "${{ env.SONAR_HOST }}/api/qualitygates/create?name=Custom" || true
+
+          # Get coverage condition ID and update to 60%
+          COVERAGE_ID=$(curl -s -u admin:${SONAR_ADMIN_PASSWORD} \
+            "${{ env.SONAR_HOST }}/api/qualitygates/show?name=Custom" \
+            | grep -o '"id":"[^"]*","metric":"new_coverage"' | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+          if [ -n "$COVERAGE_ID" ]; then
+            curl -s -u admin:${SONAR_ADMIN_PASSWORD} -X POST \
+              "${{ env.SONAR_HOST }}/api/qualitygates/update_condition" \
+              -d "id=${COVERAGE_ID}&metric=new_coverage&op=LT&error=60"
+          fi
+
+          # Set as default quality gate
+          curl -s -u admin:${SONAR_ADMIN_PASSWORD} -X POST \
+            "${{ env.SONAR_HOST }}/api/qualitygates/set_as_default?name=Custom" || true
+
+          echo "✅ SonarQube project, token, and quality gate created"
+
+      - name: Install sonar-scanner
+        run: |
+          export SONAR_SCANNER_VERSION=5.0.1.3006
+          curl -sSLo sonar-scanner.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux.zip"
+          unzip -q sonar-scanner.zip
+          echo "$PWD/sonar-scanner-${SONAR_SCANNER_VERSION}-linux/bin" >> $GITHUB_PATH
+
+      - name: Run SonarQube analysis
+        run: |
+          sonar-scanner \
+            -Dsonar.host.url=${{ env.SONAR_HOST }} \
+            -Dsonar.token=${{ steps.sonar-setup.outputs.SONAR_TOKEN }}
+
+      - name: Check Quality Gate
+        env:
+          SONAR_ADMIN_PASSWORD: ${{ secrets.SONAR_ADMIN_PASSWORD || 'Admin@12345678' }}
+        run: |
+          echo "🚦 Checking Quality Gate..."
+          sleep 10
+          QG_STATUS=$(curl -s -u admin:${SONAR_ADMIN_PASSWORD} \
+            "${{ env.SONAR_HOST }}/api/qualitygates/project_status?projectKey=agnos-devops" \
+            | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+          echo "Quality Gate Status: ${QG_STATUS}"
+          if [ "$QG_STATUS" = "ERROR" ]; then
+            echo "❌ Quality Gate FAILED"
+            exit 1
+          fi
+          echo "✅ Quality Gate PASSED"
+
+  # =========================================
+  # Stage 4: Build Docker Images
+  # =========================================
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, sast]
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Derive image tag
+        id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "IMAGE_TAG=${{ env.DEPLOY_ENV }}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "📦 Image tag: ${{ env.DEPLOY_ENV }}-${SHORT_SHA}"
+
+      - name: Set up Docker Buildx
+        if: ${{ !env.ACT }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        run: |
+          echo "🐳 Building API image..."
+          docker build -t ${{ env.API_IMAGE }}:${{ steps.tag.outputs.IMAGE_TAG }} -t ${{ env.API_IMAGE }}:latest ./api
+          echo "✅ ${{ env.API_IMAGE }}:${{ steps.tag.outputs.IMAGE_TAG }} built"
+
+      - name: Build Worker image
+        run: |
+          echo "🐳 Building Worker image..."
+          docker build -t ${{ env.WORKER_IMAGE }}:${{ steps.tag.outputs.IMAGE_TAG }} -t ${{ env.WORKER_IMAGE }}:latest ./worker
+          echo "✅ ${{ env.WORKER_IMAGE }}:${{ steps.tag.outputs.IMAGE_TAG }} built"
+
+      - name: Show image sizes
+        run: |
+          echo "📏 Image sizes:"
+          docker images agnos/* --format "   {{.Repository}}:{{.Tag}} → {{.Size}}"
+
+      - name: Save Docker images as artifacts
+        run: |
+          docker save ${{ env.API_IMAGE }}:${{ steps.tag.outputs.IMAGE_TAG }} ${{ env.API_IMAGE }}:latest \
+                      ${{ env.WORKER_IMAGE }}:${{ steps.tag.outputs.IMAGE_TAG }} ${{ env.WORKER_IMAGE }}:latest \
+            | gzip > docker-images.tar.gz
+
+      - name: Upload Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: docker-images.tar.gz
+          retention-days: 1
+
+  # =========================================
+  # Stage 5: Image Security Scan (Trivy)
+  # =========================================
+  image-scan:
+    name: Image Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Build images (act — shared Docker daemon already has them)
+        if: ${{ env.ACT }}
+        run: |
+          echo "🐳 Images should exist on shared Docker daemon from build job"
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            echo "⚠️ Rebuilding images..."
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          else
+            echo "✅ Images found on Docker daemon"
+          fi
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Trivy vulnerability scan - API
+        run: |
+          echo "🔍 Scanning agnos/api:latest for vulnerabilities..."
+          trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed agnos/api:latest
+
+      - name: Trivy vulnerability scan - Worker
+        run: |
+          echo "🔍 Scanning agnos/worker:latest for vulnerabilities..."
+          trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed agnos/worker:latest
+
+      - name: Trivy secret scan - API
+        run: |
+          echo "🔍 Scanning agnos/api:latest for secrets..."
+          trivy image --scanners secret --exit-code 1 agnos/api:latest
+
+      - name: Trivy secret scan - Worker
+        run: |
+          echo "🔍 Scanning agnos/worker:latest for secrets..."
+          trivy image --scanners secret --exit-code 1 agnos/worker:latest
+
+  # =========================================
+  # Stage 6a: Deploy DEV (dev branch only)
+  # =========================================
+  deploy-dev:
+    name: Deploy DEV
+    runs-on: ubuntu-latest
+    needs: [build, image-scan]
+    if: github.ref == 'refs/heads/dev'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Ensure images exist (act — shared Docker daemon)
+        if: ${{ env.ACT }}
+        run: |
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            echo "⚠️ Rebuilding images..."
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          else
+            echo "✅ Images found on Docker daemon"
+          fi
+
+      - name: Install Kubectl and Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) GOARCH="amd64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${GOARCH}/kubectl"
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-${GOARCH}"
+          chmod +x ./kind
+          mv ./kind /usr/local/bin/kind
+
+      - name: Create Kind cluster
+        run: |
+          kind delete cluster --name agnos-cluster 2>/dev/null || true
+          cat <<EOF | kind create cluster --name agnos-cluster --config=- --wait 120s
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 8080
+                  protocol: TCP
+                - containerPort: 30090
+                  hostPort: 9090
+                  protocol: TCP
+            - role: worker
+            - role: worker
+          EOF
+          echo "✅ Kind cluster created for DEV deployment"
+          kubectl get nodes -o wide
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image agnos/api:latest --name agnos-cluster
+          kind load docker-image agnos/worker:latest --name agnos-cluster
+          echo "✅ Images loaded into Kind"
+
+      - name: Create namespaces
+        run: |
+          kubectl apply -f k8s/base/namespaces.yaml
+
+      - name: Install CloudNativePG operator
+        run: |
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+          echo "⏳ Waiting for CNPG operator..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=120s
+          echo "✅ CNPG operator ready"
+
+      - name: Deploy DEV environment
+        run: |
+          echo "🟢 Deploying DEV..."
+          kubectl apply -f k8s/envs/dev/all.yaml
+
+          echo "⏳ Waiting for PostgreSQL cluster to be ready..."
+          for i in $(seq 1 60); do
+            READY=$(kubectl get cluster postgres -n agnos-dev -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo "0")
+            if [ "$READY" -ge 1 ] 2>/dev/null; then
+              echo "✅ PostgreSQL primary ready (${READY} instances)"
+              break
+            fi
+            echo "  Waiting for PostgreSQL... ($i/60)"
+            sleep 5
+          done
+
+          kubectl rollout status deployment/api -n agnos-dev --timeout=180s
+          kubectl rollout status deployment/worker -n agnos-dev --timeout=180s
+          echo "✅ DEV deployed"
+
+      - name: E2E health verification (DEV)
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  🔍 E2E Verification: DEV"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          PASS=true
+
+          # Check API pods ready
+          API_READY=$(kubectl get pods -n agnos-dev -l app=api -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+          echo "  API pod ready: $API_READY"
+          if echo "$API_READY" | grep -q "False"; then echo "  ❌ API not ready"; PASS=false; else echo "  ✅ API pods ready"; fi
+
+          # Check Worker pods ready
+          WORKER_READY=$(kubectl get pods -n agnos-dev -l app=worker -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+          echo "  Worker pod ready: $WORKER_READY"
+          if echo "$WORKER_READY" | grep -q "False"; then echo "  ❌ Worker not ready"; PASS=false; else echo "  ✅ Worker pods ready"; fi
+
+          # Verify API health via port-forward
+          API_POD=$(kubectl get pods -n agnos-dev -l app=api -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward -n agnos-dev "$API_POD" 18080:8080 &
+          PF_PID=$!
+          sleep 2
+          LIVE=$(curl -s http://localhost:18080/live || echo "FAIL")
+          echo "  API /live: $LIVE"
+          if echo "$LIVE" | grep -q '"ok"'; then echo "  ✅ API liveness OK"; else echo "  ❌ API liveness FAILED"; PASS=false; fi
+          METRICS=$(curl -s http://localhost:18080/metrics | head -1 || echo "FAIL")
+          if [ -n "$METRICS" ] && [ "$METRICS" != "FAIL" ]; then echo "  ✅ API metrics OK"; else echo "  ❌ API metrics FAILED"; PASS=false; fi
+          kill $PF_PID 2>/dev/null || true
+
+          # Verify Worker health via port-forward
+          WORKER_POD=$(kubectl get pods -n agnos-dev -l app=worker -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward -n agnos-dev "$WORKER_POD" 18081:8081 &
+          PF_PID=$!
+          sleep 2
+          WLIVE=$(curl -s http://localhost:18081/live || echo "FAIL")
+          echo "  Worker /live: $WLIVE"
+          if echo "$WLIVE" | grep -q '"ok"'; then echo "  ✅ Worker liveness OK"; else echo "  ❌ Worker liveness FAILED"; PASS=false; fi
+          kill $PF_PID 2>/dev/null || true
+
+          # Verify public API endpoint via NodePort
+          echo "  Testing public API endpoint..."
+          PUBLIC=$(curl -s http://localhost:9090/api/v1/time || echo "FAIL")
+          echo "  Public /api/v1/time: $PUBLIC"
+          if echo "$PUBLIC" | grep -q '"status":"ok"'; then echo "  ✅ Public API OK"; else echo "  ❌ Public API FAILED"; PASS=false; fi
+
+          if [ "$PASS" = "false" ]; then echo "❌ DEV E2E verification failed!"; exit 1; fi
+          echo "✅ All DEV E2E checks passed"
+
+      - name: Verify DEV environment
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  📋 Environment: DEV"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Pods:"
+          kubectl get pods -n agnos-dev -o wide
+          echo "Services:"
+          kubectl get svc -n agnos-dev
+          echo "HPA:"
+          kubectl get hpa -n agnos-dev 2>/dev/null || echo "  (none)"
+          echo "PDB:"
+          kubectl get pdb -n agnos-dev 2>/dev/null || echo "  (none)"
+
+      - name: Cleanup Kind cluster
+        if: always()
+        run: |
+          if [ "$SKIP_KIND_CLEANUP" = "true" ]; then
+            echo "⏭️ Skipping Kind cluster cleanup"
+          else
+            kind delete cluster --name agnos-cluster || true
+          fi
+
+  # =========================================
+  # Stage 6b: Deploy UAT (uat branch only)
+  # =========================================
+  deploy-uat:
+    name: Deploy UAT
+    runs-on: ubuntu-latest
+    needs: [build, image-scan, sonarqube]
+    if: github.ref == 'refs/heads/uat'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Ensure images exist (act — shared Docker daemon)
+        if: ${{ env.ACT }}
+        run: |
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            echo "⚠️ Rebuilding images..."
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          else
+            echo "✅ Images found on Docker daemon"
+          fi
+
+      - name: Install Kubectl and Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) GOARCH="amd64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${GOARCH}/kubectl"
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-${GOARCH}"
+          chmod +x ./kind
+          mv ./kind /usr/local/bin/kind
+
+      - name: Create Kind cluster
+        run: |
+          kind delete cluster --name agnos-cluster 2>/dev/null || true
+          cat <<EOF | kind create cluster --name agnos-cluster --config=- --wait 120s
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 8080
+                  protocol: TCP
+                - containerPort: 30081
+                  hostPort: 8081
+                  protocol: TCP
+                - containerPort: 30091
+                  hostPort: 9091
+                  protocol: TCP
+            - role: worker
+            - role: worker
+            - role: worker
+          EOF
+          echo "✅ Kind cluster created for UAT deployment"
+          kubectl get nodes -o wide
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image agnos/api:latest --name agnos-cluster
+          kind load docker-image agnos/worker:latest --name agnos-cluster
+          echo "✅ Images loaded into Kind"
+
+      - name: Create namespaces
+        run: |
+          kubectl apply -f k8s/base/namespaces.yaml
+
+      - name: Install CloudNativePG operator
+        run: |
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+          echo "⏳ Waiting for CNPG operator..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=120s
+          echo "✅ CNPG operator ready"
+
+      - name: Deploy UAT environment
+        run: |
+          echo "🟡 Deploying UAT..."
+          kubectl apply -f k8s/envs/uat/all.yaml
+
+          echo "⏳ Waiting for PostgreSQL cluster to be ready..."
+          for i in $(seq 1 60); do
+            READY=$(kubectl get cluster postgres -n agnos-uat -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo "0")
+            if [ "$READY" -ge 1 ] 2>/dev/null; then
+              echo "✅ PostgreSQL primary ready (${READY} instances)"
+              break
+            fi
+            echo "  Waiting for PostgreSQL... ($i/60)"
+            sleep 5
+          done
+
+          kubectl rollout status deployment/api -n agnos-uat --timeout=180s
+          kubectl rollout status deployment/worker -n agnos-uat --timeout=180s
+          echo "✅ UAT deployed"
+
+      - name: E2E health verification (UAT)
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  🔍 E2E Verification: UAT"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          PASS=true
+
+          # Check API pods ready
+          API_READY=$(kubectl get pods -n agnos-uat -l app=api -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+          echo "  API pod ready: $API_READY"
+          if echo "$API_READY" | grep -q "False"; then echo "  ❌ API not ready"; PASS=false; else echo "  ✅ API pods ready"; fi
+
+          # Check Worker pods ready
+          WORKER_READY=$(kubectl get pods -n agnos-uat -l app=worker -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+          echo "  Worker pod ready: $WORKER_READY"
+          if echo "$WORKER_READY" | grep -q "False"; then echo "  ❌ Worker not ready"; PASS=false; else echo "  ✅ Worker pods ready"; fi
+
+          # Verify API health via port-forward
+          API_POD=$(kubectl get pods -n agnos-uat -l app=api -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward -n agnos-uat "$API_POD" 28080:8080 &
+          PF_PID=$!
+          sleep 2
+          LIVE=$(curl -s http://localhost:28080/live || echo "FAIL")
+          echo "  API /live: $LIVE"
+          if echo "$LIVE" | grep -q '"ok"'; then echo "  ✅ API liveness OK"; else echo "  ❌ API liveness FAILED"; PASS=false; fi
+          METRICS=$(curl -s http://localhost:28080/metrics | head -1 || echo "FAIL")
+          if [ -n "$METRICS" ] && [ "$METRICS" != "FAIL" ]; then echo "  ✅ API metrics OK"; else echo "  ❌ API metrics FAILED"; PASS=false; fi
+          kill $PF_PID 2>/dev/null || true
+
+          # Verify Worker health via port-forward
+          WORKER_POD=$(kubectl get pods -n agnos-uat -l app=worker -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward -n agnos-uat "$WORKER_POD" 28081:8081 &
+          PF_PID=$!
+          sleep 2
+          WLIVE=$(curl -s http://localhost:28081/live || echo "FAIL")
+          echo "  Worker /live: $WLIVE"
+          if echo "$WLIVE" | grep -q '"ok"'; then echo "  ✅ Worker liveness OK"; else echo "  ❌ Worker liveness FAILED"; PASS=false; fi
+          kill $PF_PID 2>/dev/null || true
+
+          # Verify public API endpoint via NodePort
+          echo "  Testing public API endpoint..."
+          PUBLIC=$(curl -s http://localhost:9091/api/v1/time || echo "FAIL")
+          echo "  Public /api/v1/time: $PUBLIC"
+          if echo "$PUBLIC" | grep -q '"status":"ok"'; then echo "  ✅ Public API OK"; else echo "  ❌ Public API FAILED"; PASS=false; fi
+
+          if [ "$PASS" = "false" ]; then echo "❌ UAT E2E verification failed!"; exit 1; fi
+          echo "✅ All UAT E2E checks passed"
+
+      - name: Verify UAT environment
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  📋 Environment: UAT"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Pods:"
+          kubectl get pods -n agnos-uat -o wide
+          echo "Services:"
+          kubectl get svc -n agnos-uat
+          echo "HPA:"
+          kubectl get hpa -n agnos-uat 2>/dev/null || echo "  (none)"
+          echo "PDB:"
+          kubectl get pdb -n agnos-uat 2>/dev/null || echo "  (none)"
+
+      - name: Cleanup Kind cluster
+        if: always()
+        run: |
+          if [ "$SKIP_KIND_CLEANUP" = "true" ]; then
+            echo "⏭️ Skipping Kind cluster cleanup"
+          else
+            kind delete cluster --name agnos-cluster || true
+          fi
+
+  # =========================================
+  # Stage 6c: Deploy PROD (prod branch, manual approval)
+  # =========================================
+  deploy-prod:
+    name: Deploy PROD
+    runs-on: ubuntu-latest
+    needs: [build, image-scan, sonarqube]
+    if: github.ref == 'refs/heads/prod'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Ensure images exist (act — shared Docker daemon)
+        if: ${{ env.ACT }}
+        run: |
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            echo "⚠️ Rebuilding images..."
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          else
+            echo "✅ Images found on Docker daemon"
+          fi
+
+      - name: Install Kubectl and Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) GOARCH="amd64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${GOARCH}/kubectl"
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-${GOARCH}"
+          chmod +x ./kind
+          mv ./kind /usr/local/bin/kind
+
+      - name: Create multi-node Kind cluster
+        run: |
+          kind delete cluster --name agnos-cluster 2>/dev/null || true
+          cat <<EOF | kind create cluster --name agnos-cluster --config=- --wait 120s
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 8080
+                  protocol: TCP
+                - containerPort: 30092
+                  hostPort: 9092
+                  protocol: TCP
+            - role: worker
+            - role: worker
+            - role: worker
+          EOF
+          echo "✅ Kind cluster created for PROD deployment"
+          kubectl get nodes -o wide
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image agnos/api:latest --name agnos-cluster
+          kind load docker-image agnos/worker:latest --name agnos-cluster
+          echo "✅ Images loaded into all nodes"
+
+      - name: Create namespace
+        run: |
+          kubectl apply -f k8s/base/namespaces.yaml
+          echo "✅ Namespaces created"
+
+      - name: Install CloudNativePG operator
+        run: |
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+          echo "⏳ Waiting for CNPG operator..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=120s
+          echo "✅ CNPG operator ready"
+
+      - name: Deploy PROD environment
+        run: |
+          echo "🔴 Deploying PROD..."
+          kubectl apply -f k8s/envs/prod/all.yaml
+
+          echo "⏳ Waiting for PostgreSQL cluster to be ready..."
+          for i in $(seq 1 60); do
+            READY=$(kubectl get cluster postgres -n agnos-prod -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo "0")
+            if [ "$READY" -ge 1 ] 2>/dev/null; then
+              echo "✅ PostgreSQL primary ready (${READY} instances)"
+              break
+            fi
+            echo "  Waiting for PostgreSQL... ($i/60)"
+            sleep 5
+          done
+
+          kubectl rollout status deployment/api -n agnos-prod --timeout=180s
+          kubectl rollout status deployment/worker -n agnos-prod --timeout=180s
+          echo "✅ PROD deployed"
+
+      - name: E2E health verification (PROD)
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  🔍 E2E Verification: PROD"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          PASS=true
+
+          # Check API pods ready
+          API_READY=$(kubectl get pods -n agnos-prod -l app=api -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+          echo "  API pod ready: $API_READY"
+          if echo "$API_READY" | grep -q "False"; then echo "  ❌ API not ready"; PASS=false; else echo "  ✅ API pods ready"; fi
+
+          # Check Worker pods ready
+          WORKER_READY=$(kubectl get pods -n agnos-prod -l app=worker -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+          echo "  Worker pod ready: $WORKER_READY"
+          if echo "$WORKER_READY" | grep -q "False"; then echo "  ❌ Worker not ready"; PASS=false; else echo "  ✅ Worker pods ready"; fi
+
+          # Verify API health via port-forward
+          API_POD=$(kubectl get pods -n agnos-prod -l app=api -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward -n agnos-prod "$API_POD" 38080:8080 &
+          PF_PID=$!
+          sleep 2
+          LIVE=$(curl -s http://localhost:38080/live || echo "FAIL")
+          echo "  API /live: $LIVE"
+          if echo "$LIVE" | grep -q '"ok"'; then echo "  ✅ API liveness OK"; else echo "  ❌ API liveness FAILED"; PASS=false; fi
+          METRICS=$(curl -s http://localhost:38080/metrics | head -1 || echo "FAIL")
+          if [ -n "$METRICS" ] && [ "$METRICS" != "FAIL" ]; then echo "  ✅ API metrics OK"; else echo "  ❌ API metrics FAILED"; PASS=false; fi
+          kill $PF_PID 2>/dev/null || true
+
+          # Verify Worker health via port-forward
+          WORKER_POD=$(kubectl get pods -n agnos-prod -l app=worker -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward -n agnos-prod "$WORKER_POD" 38081:8081 &
+          PF_PID=$!
+          sleep 2
+          WLIVE=$(curl -s http://localhost:38081/live || echo "FAIL")
+          echo "  Worker /live: $WLIVE"
+          if echo "$WLIVE" | grep -q '"ok"'; then echo "  ✅ Worker liveness OK"; else echo "  ❌ Worker liveness FAILED"; PASS=false; fi
+          kill $PF_PID 2>/dev/null || true
+
+          # Verify public API endpoint via NodePort
+          echo "  Testing public API endpoint..."
+          PUBLIC=$(curl -s http://localhost:9092/api/v1/time || echo "FAIL")
+          echo "  Public /api/v1/time: $PUBLIC"
+          if echo "$PUBLIC" | grep -q '"status":"ok"'; then echo "  ✅ Public API OK"; else echo "  ❌ Public API FAILED"; PASS=false; fi
+
+          if [ "$PASS" = "false" ]; then echo "❌ PROD E2E verification failed!"; exit 1; fi
+          echo "✅ All PROD E2E checks passed"
+
+      - name: Verify PROD environment
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  📋 Environment: PROD"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Pods:"
+          kubectl get pods -n agnos-prod -o wide
+          echo "Services:"
+          kubectl get svc -n agnos-prod
+          echo "HPA:"
+          kubectl get hpa -n agnos-prod 2>/dev/null || echo "  (none)"
+          echo "PDB:"
+          kubectl get pdb -n agnos-prod 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  🎉 PROD Deployed Successfully!          ║"
+          echo "║  PROD: agnos-prod (3 API + 2 Worker)     ║"
+          echo "╚══════════════════════════════════════════╝"
+
+      - name: Cleanup Kind cluster
+        if: always()
+        run: |
+          if [ "$SKIP_KIND_CLEANUP" = "true" ]; then
+            echo "⏭️ Skipping Kind cluster cleanup"
+          else
+            kind delete cluster --name agnos-cluster || true
+          fi
+
+  # =========================================
+  # Stage 7: Chaos Testing (uat only)
+  # =========================================
+  chaos-test-uat:
+    name: Chaos Test UAT (LitmusChaos)
+    runs-on: ubuntu-latest
+    needs: [deploy-uat]
+    if: github.ref == 'refs/heads/uat'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Ensure images exist (act)
+        if: ${{ env.ACT }}
+        run: |
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          fi
+
+      - name: Install Kubectl and Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) GOARCH="amd64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${GOARCH}/kubectl"
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-${GOARCH}"
+          chmod +x ./kind
+          mv ./kind /usr/local/bin/kind
+
+      - name: Create Kind cluster for chaos testing
+        run: |
+          kind delete cluster --name agnos-chaos 2>/dev/null || true
+          cat <<EOF | kind create cluster --name agnos-chaos --config=- --wait 120s
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+            - role: worker
+          EOF
+          echo "✅ Kind cluster for chaos testing created"
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image agnos/api:latest --name agnos-chaos
+          kind load docker-image agnos/worker:latest --name agnos-chaos
+
+      - name: Install CloudNativePG operator
+        run: |
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+          echo "⏳ Waiting for CNPG operator..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=120s
+          echo "✅ CNPG operator ready"
+
+      - name: Deploy DEV for chaos testing
+        run: |
+          kubectl apply -f k8s/base/namespaces.yaml
+          kubectl apply -f k8s/envs/dev/all.yaml
+
+          echo "⏳ Waiting for PostgreSQL cluster to be ready..."
+          for i in $(seq 1 60); do
+            READY=$(kubectl get cluster postgres -n agnos-dev -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo "0")
+            if [ "$READY" -ge 1 ] 2>/dev/null; then
+              echo "✅ PostgreSQL primary ready (${READY} instances)"
+              break
+            fi
+            echo "  Waiting for PostgreSQL... ($i/60)"
+            sleep 5
+          done
+
+          kubectl rollout status deployment/api -n agnos-dev --timeout=180s
+          kubectl rollout status deployment/worker -n agnos-dev --timeout=180s
+          echo "✅ DEV deployed for chaos testing"
+
+      - name: Install LitmusChaos operator
+        run: |
+          echo "🔧 Installing LitmusChaos operator..."
+          kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.0.0.yaml
+          echo "⏳ Waiting for LitmusChaos operator to be ready..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=operator --timeout=120s -n litmus 2>/dev/null || \
+          kubectl wait --for=condition=ready pod -l name=chaos-operator-ce --timeout=120s -n litmus 2>/dev/null || \
+          sleep 30
+          echo "✅ LitmusChaos operator installed"
+
+      - name: Apply chaos RBAC
+        run: |
+          kubectl apply -f k8s/litmus/dev/rbac.yaml
+          echo "✅ Chaos RBAC applied"
+
+      - name: Run pod-delete chaos experiment (DEV)
+        run: |
+          echo "🔥 Running pod-delete experiment on DEV..."
+          kubectl apply -f k8s/litmus/dev/pod-delete.yaml
+
+          # Wait for chaos experiment to complete (timeout 3 min)
+          for i in $(seq 1 36); do
+            STATUS=$(kubectl get chaosengine api-pod-delete -n agnos-dev -o jsonpath='{.status.engineStatus}' 2>/dev/null || echo "waiting")
+            echo "  Chaos engine status: $STATUS ($i/36)"
+            if [ "$STATUS" = "completed" ] || [ "$STATUS" = "stopped" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          # Check result
+          VERDICT=$(kubectl get chaosresult -n agnos-dev -o jsonpath='{.items[0].status.experimentStatus.verdict}' 2>/dev/null || echo "unknown")
+          echo "  Experiment verdict: $VERDICT"
+
+      - name: Verify services recovered after chaos
+        run: |
+          echo "🔍 Verifying services recovered after chaos..."
+          sleep 10
+          kubectl rollout status deployment/api -n agnos-dev --timeout=60s
+
+          PASS=true
+          API_POD=$(kubectl get pods -n agnos-dev -l app=api --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -z "$API_POD" ]; then
+            echo "  ❌ No running API pod in DEV"
+            PASS=false
+          else
+            kubectl port-forward -n agnos-dev "$API_POD" 48080:8080 &
+            PF_PID=$!
+            sleep 3
+            LIVE=$(curl -s http://localhost:48080/live || echo "FAIL")
+            if echo "$LIVE" | grep -q '"ok"'; then
+              echo "  ✅ DEV API recovered and healthy"
+            else
+              echo "  ❌ DEV API not healthy after chaos"
+              PASS=false
+            fi
+            kill $PF_PID 2>/dev/null || true
+          fi
+
+          if [ "$PASS" = "false" ]; then
+            echo "❌ Post-chaos verification failed!"
+            exit 1
+          fi
+          echo "✅ Services recovered successfully after chaos testing"
+
+      - name: Collect chaos results
+        if: always()
+        run: |
+          mkdir -p results/chaos-test
+          echo "📊 Chaos Test Results:"
+          echo ""
+          echo "━━━ DEV ━━━"
+          kubectl get chaosresult -n agnos-dev -o wide 2>/dev/null || echo "  No results"
+          kubectl get chaosresult -n agnos-dev -o json > results/chaos-test/chaos-results.json 2>/dev/null || echo '{"items":[]}' > results/chaos-test/chaos-results.json
+
+      - name: Upload chaos test results
+        if: ${{ always() && !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chaos-test-dev
+          path: results/chaos-test/
+          retention-days: 7
+
+      - name: Copy results to shared dir (act)
+        if: ${{ always() && env.ACT }}
+        run: |
+          mkdir -p /tmp/act-results/chaos-test
+          cp -r results/chaos-test/* /tmp/act-results/chaos-test/ 2>/dev/null || true
+
+      - name: Cleanup chaos cluster
+        if: always()
+        run: |
+          kind delete cluster --name agnos-chaos || true
+
+  # =========================================
+  # Stage 7b: Chaos Testing UAT (uat branch)
+  # =========================================
+  chaos-test-uat:
+    name: Chaos Test UAT (LitmusChaos)
+    runs-on: ubuntu-latest
+    needs: [deploy-uat]
+    if: github.ref == 'refs/heads/uat'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Ensure images exist (act)
+        if: ${{ env.ACT }}
+        run: |
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          fi
+
+      - name: Install Kubectl and Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) GOARCH="amd64" ;;
+            aarch64|arm64) GOARCH="arm64" ;;
+            *) GOARCH="amd64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${GOARCH}/kubectl"
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-${GOARCH}"
+          chmod +x ./kind
+          mv ./kind /usr/local/bin/kind
+
+      - name: Create Kind cluster for chaos testing
+        run: |
+          kind delete cluster --name agnos-chaos 2>/dev/null || true
+          cat <<EOF | kind create cluster --name agnos-chaos --config=- --wait 120s
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              kubeadmConfigPatches:
+                - |
+                  kind: KubeletConfiguration
+                  systemReserved:
+                    cpu: 500m
+                    memory: 512Mi
+            - role: worker
+              kubeadmConfigPatches:
+                - |
+                  kind: KubeletConfiguration
+                  systemReserved:
+                    cpu: 500m
+                    memory: 512Mi
+            - role: worker
+              kubeadmConfigPatches:
+                - |
+                  kind: KubeletConfiguration
+                  systemReserved:
+                    cpu: 500m
+                    memory: 512Mi
+            - role: worker
+          EOF
+          echo "✅ Kind cluster for UAT chaos testing created"
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image agnos/api:latest --name agnos-chaos
+          kind load docker-image agnos/worker:latest --name agnos-chaos
+
+      - name: Install CloudNativePG operator
+        run: |
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+          echo "⏳ Waiting for CNPG operator..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=120s
+          echo "✅ CNPG operator ready"
+
+      - name: Deploy UAT for chaos testing
+        run: |
+          kubectl apply -f k8s/base/namespaces.yaml
+          kubectl apply -f k8s/envs/uat/all.yaml
+
+          echo "⏳ Waiting for PostgreSQL cluster to be ready..."
+          for i in $(seq 1 60); do
+            READY=$(kubectl get cluster postgres -n agnos-uat -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo "0")
+            if [ "$READY" -ge 1 ] 2>/dev/null; then
+              echo "✅ PostgreSQL primary ready (${READY} instances)"
+              break
+            fi
+            echo "  Waiting for PostgreSQL... ($i/60)"
+            sleep 5
+          done
+
+          kubectl rollout status deployment/api -n agnos-uat --timeout=180s
+          kubectl rollout status deployment/worker -n agnos-uat --timeout=180s
+          echo "✅ UAT deployed for chaos testing"
+
+      - name: Install LitmusChaos operator
+        run: |
+          echo "🔧 Installing LitmusChaos operator..."
+          kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.0.0.yaml
+          echo "⏳ Waiting for LitmusChaos operator to be ready..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=operator --timeout=120s -n litmus 2>/dev/null || \
+          kubectl wait --for=condition=ready pod -l name=chaos-operator-ce --timeout=120s -n litmus 2>/dev/null || \
+          sleep 30
+          echo "✅ LitmusChaos operator installed"
+
+      - name: Apply chaos RBAC
+        run: |
+          kubectl apply -f k8s/litmus/uat/rbac.yaml
+          echo "✅ Chaos RBAC applied"
+
+      - name: Run pod-delete chaos experiment (UAT)
+        run: |
+          echo "🔥 Running pod-delete experiment on UAT..."
+          kubectl apply -f k8s/litmus/uat/pod-delete.yaml
+
+          # Wait for chaos experiment to complete (timeout 4 min)
+          for i in $(seq 1 48); do
+            STATUS=$(kubectl get chaosengine api-pod-delete -n agnos-uat -o jsonpath='{.status.engineStatus}' 2>/dev/null || echo "waiting")
+            echo "  Chaos engine status: $STATUS ($i/48)"
+            if [ "$STATUS" = "completed" ] || [ "$STATUS" = "stopped" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          VERDICT=$(kubectl get chaosresult -n agnos-uat -o jsonpath='{.items[0].status.experimentStatus.verdict}' 2>/dev/null || echo "unknown")
+          echo "  Experiment verdict: $VERDICT"
+
+      - name: Verify services recovered after chaos
+        run: |
+          echo "🔍 Verifying services recovered after chaos..."
+          sleep 10
+          kubectl rollout status deployment/api -n agnos-uat --timeout=60s
+
+          PASS=true
+          API_POD=$(kubectl get pods -n agnos-uat -l app=api --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -z "$API_POD" ]; then
+            echo "  ❌ No running API pod in UAT"
+            PASS=false
+          else
+            kubectl port-forward -n agnos-uat "$API_POD" 48080:8080 &
+            PF_PID=$!
+            sleep 3
+            LIVE=$(curl -s http://localhost:48080/live || echo "FAIL")
+            if echo "$LIVE" | grep -q '"ok"'; then
+              echo "  ✅ UAT API recovered and healthy"
+            else
+              echo "  ❌ UAT API not healthy after chaos"
+              PASS=false
+            fi
+            kill $PF_PID 2>/dev/null || true
+          fi
+
+          if [ "$PASS" = "false" ]; then
+            echo "❌ Post-chaos verification failed!"
+            exit 1
+          fi
+          echo "✅ Services recovered successfully after chaos testing"
+
+      - name: Collect chaos results
+        if: always()
+        run: |
+          mkdir -p results/chaos-test
+          echo "📊 Chaos Test Results:"
+          echo ""
+          echo "━━━ UAT ━━━"
+          kubectl get chaosresult -n agnos-uat -o wide 2>/dev/null || echo "  No results"
+          kubectl get chaosresult -n agnos-uat -o json > results/chaos-test/chaos-results.json 2>/dev/null || echo '{"items":[]}' > results/chaos-test/chaos-results.json
+
+      - name: Upload chaos test results
+        if: ${{ always() && !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chaos-test-uat
+          path: results/chaos-test/
+          retention-days: 7
+
+      - name: Copy results to shared dir (act)
+        if: ${{ always() && env.ACT }}
+        run: |
+          mkdir -p /tmp/act-results/chaos-test
+          cp -r results/chaos-test/* /tmp/act-results/chaos-test/ 2>/dev/null || true
+
+      - name: Cleanup chaos cluster
+        if: always()
+        run: |
+          kind delete cluster --name agnos-chaos || true
+
+  # =========================================
+  # Stage 8: Load Test (uat branch only)
+  # =========================================
+  load-test:
+    name: Load Test (k6)
+    runs-on: ubuntu-latest
+    needs: [deploy-uat]
+    if: github.ref == 'refs/heads/uat'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker images artifact
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker images (GitHub Actions)
+        if: ${{ !env.ACT }}
+        run: |
+          gunzip -c docker-images.tar.gz | docker load
+
+      - name: Ensure images exist (act)
+        if: ${{ env.ACT }}
+        run: |
+          if ! docker image inspect agnos/api:latest &>/dev/null; then
+            docker build -t agnos/api:latest ./api
+            docker build -t agnos/worker:latest ./worker
+          fi
+
+      - name: Install k6
+        run: |
+          curl -sSL https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz | tar xz
+          mv k6-v0.50.0-linux-amd64/k6 /usr/local/bin/k6
+
+      - name: Start services with Docker Compose
+        run: |
+          docker compose up -d --build --wait
+          echo "✅ Services are up on port ${API_HOST_PORT:-8080}"
+        env:
+          API_HOST_PORT: "8082"
+          WORKER_HOST_PORT: "8083"
+
+      - name: Create results directory
+        run: mkdir -p results/load-test
+
+      - name: Run k6 load test
+        run: |
+          echo "🏋️ Running load test..."
+          k6 run --out json=results/load-test/k6-load-test.json -e BASE_URL=http://localhost:${API_HOST_PORT:-8080} k6/load-test.js
+          echo "✅ Load test completed"
+        env:
+          API_HOST_PORT: "8082"
+
+      - name: Run k6 stress test
+        run: |
+          echo "🏋️ Running stress test..."
+          k6 run --out json=results/load-test/k6-stress-test.json -e BASE_URL=http://localhost:${API_HOST_PORT:-8080} k6/stress-test.js
+          echo "✅ Stress test completed"
+        env:
+          API_HOST_PORT: "8082"
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
+      - name: Upload load test results
+        if: ${{ always() && !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-load-test
+          path: results/load-test/
+          retention-days: 7
+
+      - name: Copy results to shared dir (act)
+        if: ${{ always() && env.ACT }}
+        run: |
+          mkdir -p /tmp/act-results/load-test
+          cp -r results/load-test/* /tmp/act-results/load-test/ 2>/dev/null || true
+
+  # =========================================
+  # Stage 9: Collect All Results
+  # =========================================
+  collect-results:
+    name: Collect Results
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [lint-and-test, sast, chaos-test, chaos-test-uat, load-test]
+    steps:
+      - name: Create results directory structure
+        run: mkdir -p results/{unit-test,sast,load-test,chaos-test}
+
+      - name: Download all result artifacts (GitHub Actions)
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          merge-multiple: true
+          path: results/
+
+      - name: Collect results from shared dir (act)
+        if: ${{ env.ACT }}
+        run: |
+          if [ -d /tmp/act-results ]; then
+            cp -r /tmp/act-results/* results/ 2>/dev/null || true
+            echo "✅ Results collected from shared act directory"
+          else
+            echo "⚠️ No shared results directory found"
+          fi
+
+      - name: Display results summary
+        run: |
+          echo "============================================================"
+          echo "  Combined Test Results"
+          echo "============================================================"
+          echo ""
+          find results/ -type f 2>/dev/null | sort || echo "No results collected"
+
+      - name: Copy final results to host (act)
+        if: ${{ env.ACT }}
+        run: |
+          echo ""
+          echo "📁 Results available at /tmp/act-results/"
+          ls -R /tmp/act-results/ 2>/dev/null || true
+
+      - name: Upload combined results (GitHub Actions)
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-results
+          path: results/
+          retention-days: 30

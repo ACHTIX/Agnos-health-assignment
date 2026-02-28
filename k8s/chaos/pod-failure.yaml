@@ -1,0 +1,19 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: api-pod-failure
+  namespace: agnos-prod
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    experiment: pod-failure
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - agnos-prod
+    labelSelectors:
+      app: api
+  duration: "30s"
+  scheduler:
+    cron: "@every 10m"

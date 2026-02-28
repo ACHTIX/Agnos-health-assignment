@@ -1,0 +1,71 @@
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: pod-network-latency
+  namespace: agnos-uat
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["create", "delete", "get", "list", "patch", "update", "deletecollection"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create", "get", "list", "patch", "update"]
+    - apiGroups: [""]
+      resources: ["pods/log", "pods/exec"]
+      verbs: ["get", "list", "create"]
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["create", "list", "get", "delete", "deletecollection"]
+    - apiGroups: ["litmuschaos.io"]
+      resources: ["chaosengines", "chaosexperiments", "chaosresults"]
+      verbs: ["create", "list", "get", "patch", "update", "delete"]
+    image: litmuschaos/go-runner:latest
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name pod-network-latency
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: "120"
+    - name: NETWORK_LATENCY
+      value: "300"
+    - name: JITTER
+      value: "100"
+    labels:
+      name: pod-network-latency
+      app.kubernetes.io/part-of: litmus
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: api-network-latency
+  namespace: agnos-uat
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+spec:
+  engineState: active
+  appinfo:
+    appns: agnos-uat
+    applabel: app=api
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-network-latency
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "120"
+        - name: NETWORK_LATENCY
+          value: "300"
+        - name: JITTER
+          value: "100"
+        - name: NETWORK_INTERFACE
+          value: "eth0"

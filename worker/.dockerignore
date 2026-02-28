@@ -1,0 +1,5 @@
+.git
+*.md
+*.pdf
+*_test.go
+Dockerfile

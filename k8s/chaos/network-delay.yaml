@@ -1,0 +1,29 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: api-network-delay
+  namespace: agnos-prod
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    experiment: network-delay
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - agnos-prod
+    labelSelectors:
+      app: api
+  delay:
+    latency: "200ms"
+    correlation: "50"
+    jitter: "50ms"
+  direction: to
+  target:
+    selector:
+      namespaces:
+        - agnos-prod
+      labelSelectors:
+        cnpg.io/cluster: postgres
+    mode: all
+  duration: "5m"

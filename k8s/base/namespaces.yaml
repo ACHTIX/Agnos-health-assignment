@@ -1,0 +1,27 @@
+---
+# DEV Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agnos-dev
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: dev
+---
+# UAT Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agnos-uat
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: uat
+---
+# PROD Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agnos-prod
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    environment: prod

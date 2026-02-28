@@ -1,0 +1,6 @@
+{
+  "ref": "refs/heads/prod",
+  "repository": {
+    "default_branch": "main"
+  }
+}

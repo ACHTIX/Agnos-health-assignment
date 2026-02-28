@@ -1,0 +1,5 @@
+--container-architecture linux/amd64
+--artifact-server-path /tmp/act-artifacts
+--env ACT=true
+--container-daemon-socket /var/run/docker.sock
+--container-options -v /tmp/act-results:/tmp/act-results

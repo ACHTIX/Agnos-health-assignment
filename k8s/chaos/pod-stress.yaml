@@ -1,0 +1,23 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: api-pod-stress
+  namespace: agnos-prod
+  labels:
+    app.kubernetes.io/part-of: agnos-devops
+    experiment: pod-stress
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - agnos-prod
+    labelSelectors:
+      app: api
+  stressors:
+    cpu:
+      workers: 2
+      load: 80
+    memory:
+      workers: 1
+      size: "256MB"
+  duration: "5m"

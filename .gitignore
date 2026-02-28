@@ -1,0 +1,15 @@
+.git
+*.pdf
+assignment.pdf
+coverage.out
+*-cov.out
+test-report.json
+gosec-report.json
+.scannerwork/
+
+# Test results
+results/
+
+# Compiled Go binaries
+api/api
+worker/worker

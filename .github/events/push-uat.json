@@ -1,0 +1,6 @@
+{
+  "ref": "refs/heads/uat",
+  "repository": {
+    "default_branch": "main"
+  }
+}

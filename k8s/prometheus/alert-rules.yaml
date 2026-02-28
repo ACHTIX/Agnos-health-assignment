@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-alert-rules
+  namespace: agnos
+  labels:
+    app: prometheus
+    app.kubernetes.io/part-of: agnos-devops
+data:
+  alert-rules.yaml: |
+    groups:
+      - name: api-alerts
+        rules:
+          # High error rate: >5% of requests returning 5xx for 5 minutes
+          - alert: HighErrorRate
+            expr: |
+              (
+                sum(rate(http_errors_total{app="api"}[5m]))
+                /
+                sum(rate(http_requests_total{app="api"}[5m]))
+              ) > 0.05
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High error rate detected"
+              description: "API error rate is above 5% for the last 5 minutes (current: {{ $value | humanizePercentage }})"
+
+          # High request latency: p95 > 1s for 5 minutes
+          - alert: HighRequestLatency
+            expr: |
+              histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app="api"}[5m])) by (le))
+              > 1.0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High request latency detected"
+              description: "API p95 latency is above 1 second for the last 5 minutes (current: {{ $value | humanizeDuration }})"
+
+      - name: worker-alerts
+        rules:
+          # Stalled worker: health endpoint returns unhealthy
+          - alert: WorkerStalled
+            expr: up{app="worker"} == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Worker appears stalled"
+              description: "The worker service has been unhealthy for 5 minutes"
+
+      - name: kubernetes-alerts
+        rules:
+          # Crash-looping pods
+          - alert: PodCrashLooping
+            expr: |
+              rate(kube_pod_container_status_restarts_total{namespace="agnos"}[15m]) * 60 * 5 > 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod is crash-looping"
+              description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is restarting frequently"
+
+          # Pod not ready
+          - alert: PodNotReady
+            expr: |
+              kube_pod_status_ready{namespace="agnos", condition="true"} == 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod not ready"
+              description: "Pod {{ $labels.pod }} has been in a non-ready state for 5 minutes"
+
+      - name: reliability-alerts
+        rules:
+          # High DB latency: ping > 500ms for 5 minutes
+          - alert: HighDBLatency
+            expr: |
+              histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app="api", endpoint="/ready"}[5m])) by (le))
+              > 0.5
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High database latency detected"
+              description: "DB health check (readiness probe) p95 latency is above 500ms for the last 5 minutes (current: {{ $value | humanizeDuration }})"
+
+          # Log buffer full: drops detected
+          - alert: LogBufferFull
+            expr: |
+              rate(http_rate_limited_total{app="api"}[5m]) > 0
+              or
+              increase(http_errors_total{app="api", endpoint="/other"}[5m]) > 100
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Possible log buffer saturation"
+              description: "Rate limiting or high error count detected, which may indicate log buffer drops"
+
+          # High memory usage: container memory > 80% of limit
+          - alert: HighMemoryUsage
+            expr: |
+              (
+                container_memory_working_set_bytes{namespace=~"agnos.*", container!=""}
+                /
+                container_spec_memory_limit_bytes{namespace=~"agnos.*", container!=""}
+              ) > 0.8
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage detected"
+              description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is using more than 80% of its memory limit (current: {{ $value | humanizePercentage }})"
+
+          # API down: all replicas unavailable
+          - alert: APIDown
+            expr: |
+              sum(up{app="api"}) == 0
+              or
+              absent(up{app="api"})
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "API is completely down"
+              description: "All API replicas are unavailable for the last 1 minute"
