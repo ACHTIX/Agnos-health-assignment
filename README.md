@@ -13,9 +13,9 @@ A production-ready DevOps setup with two independent Go microservices, CloudNati
 │                                                                   │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │  agnos-dev   │  │  agnos-uat   │  │  agnos-prod  │             │
-│  │  1 API       │  │  2 API       │  │  3 API       │             │
-│  │  1 Worker    │  │  1 Worker    │  │  2 Worker     │             │
-│  │  2 Postgres  │  │  2 Postgres  │  │  3 Postgres   │             │
+│  │  1 API       │  │  3 API       │  │  3 API       │             │
+│  │  1 Worker    │  │  2 Worker    │  │  2 Worker     │             │
+│  │  2 Postgres  │  │  3 Postgres  │  │  3 Postgres   │             │
 │  │  (CNPG HA)   │  │  (CNPG HA)   │  │  (CNPG HA)    │             │
 │  └─────────────┘  └─────────────┘  └─────────────┘              │
 │                                                                   │
@@ -339,6 +339,11 @@ cd worker && go test -v -race ./...
 
 # With coverage
 cd api && go test -race -coverprofile=coverage.out ./... && go tool cover -func=coverage.out
+
+# Automated Test Result Collection
+# Gather unit tests, SAST reports, SonarQube metrics, and load/stress test
+# output into the `results/` folder (runs locally or leverages act CI cache)
+./scripts/collect-results.sh
 ```
 
 ---
